@@ -4,4 +4,6 @@ markitdown[all]
 requests>=2.31
 # pyHanko doesn't ship wheels for Python 3.13 (yet).
 # Pin <3.13 or install conditionally:
-pyhanko[full]>=0.18; python_version < "3.13"
+pyhanko[full]==0.23.0
+openai
+pydantic

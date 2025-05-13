@@ -65,7 +65,9 @@ This layer focuses on the semantic content of the PDF, using a Large Language Mo
 *   **Pikepdf**: A Python library for reading, manipulating, and writing PDF files, built on the QPDF C++ library. Used for opening PDFs, structural checks, metadata extraction, and incremental update detection.
 *   **pyHanko**: A Python SDK for digitally signing PDF documents and validating signatures. Used for the digital signature analysis.
 *   **MarkItDown**: A Python library for converting various document formats (including PDF) to Markdown. Used for text extraction.
-*   **Requests**: For making HTTP requests to the LLM API.
+*   **Requests**: For making HTTP requests to the LLM API (Note: for structured output, the `openai` SDK is now primarily used).
+*   **OpenAI Python SDK**: Used for interacting with LLM APIs (like x.ai's Grok) that support structured outputs, especially for `grok-3`.
+*   **Pydantic**: For data validation and settings management through Python type annotations. Used here to define the expected schema for the LLM's structured JSON output.
 *   **LLM API (e.g., Grok 3 via x.ai)**: For the content anomaly detection.
 
 ## Code Structure (`app.py`)
@@ -82,10 +84,15 @@ The main application logic is contained within `app.py`.
     *   Returns a dictionary containing the results of these checks.
 *   **`run_second_layer(pdf_bytes: bytes) -> dict`**:
     *   Takes the PDF content as bytes.
-    *   Extracts text using `MarkItDown`.
-    *   Constructs a prompt for the LLM and sends the extracted text for analysis.
-    *   Parses the LLM's JSON response.
-    *   Returns a dictionary containing the LLM's analysis (overall assessment, detected anomalies, confidence score, and any errors).
+    *   Extracts text using `MarkItDown` (accessing `result.text_content`).
+    *   Defines Pydantic models (`AnomalyDetail`, `ContentAnalysis`) to specify the desired JSON structure for the LLM's response.
+    *   Initializes an `OpenAI` client configured for the x.ai API endpoint.
+    *   Constructs a simplified system prompt for the LLM, as the detailed output structure is now handled by the Pydantic model.
+    *   Calls the LLM (specifically `grok-3`, which supports structured output) using `client.beta.chat.completions.parse()`, passing the Pydantic model in the `response_format` argument.
+    *   The LLM's response is automatically parsed into an instance of the `ContentAnalysis` Pydantic model.
+    *   Converts the Pydantic model instance to a dictionary using `.model_dump()` for consistent storage in the results.
+    *   Includes robust error handling for text extraction and the LLM API call.
+    *   Returns a dictionary containing the LLM's structured analysis or any errors encountered.
 *   **`main()` Function**:
     *   Sets up the main Streamlit interface (title, file uploader).
     *   Handles the PDF file upload.

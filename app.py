@@ -130,188 +130,159 @@ def run_first_layer(pdf_bytes: bytes, reference_hash: str | None = None) -> dict
     # 4 — Metadata Extraction
     metadata = {}
     try:
-        docinfo = pdf.docinfo
-        for key, value in docinfo.items():
-            if isinstance(value, pikepdf.String) and value.startswith('D:'):
-                try:
-                    date_str = str(value)[2:] # Remove 'D:'
-                    if 'Z' in date_str: date_str = date_str.replace('Z', '')
-                    if '+' in date_str: date_str = date_str.split('+')[0]
-                    if '-' in date_str: date_str = date_str.split('-')[0] 
-                    date_str_core = date_str[:14]
-                    dt_obj = datetime.strptime(date_str_core, "%Y%m%d%H%M%S")
-                    metadata[str(key)] = dt_obj.isoformat()
-                except ValueError:
-                    metadata[str(key)] = str(value) 
-            else:
-                metadata[str(key)] = str(value)
-        results['docinfo_metadata'] = metadata
+        # pdf.docinfo attempts to access pdf.trailer["/Info"]
+        # We should check if /Info exists and is a dictionary first
+        info_obj = pdf.trailer.get('/Info')
+        if isinstance(info_obj, pikepdf.Dictionary):
+            docinfo = pdf.docinfo # Safe to access now
+            for key, value in docinfo.items():
+                # Dates like /CreationDate (D:20230401123045Z) need parsing
+                if isinstance(value, pikepdf.String) and value.startswith('D:'):
+                    try:
+                        # Simplified parsing, PDF date format can be complex
+                        # D:YYYYMMDDHHMMSSOHH'mm'
+                        # Example: D:20240115103000-05'00'
+                        date_str = str(value)[2:] # Remove 'D:'
+                        # Remove timezone offset for simplicity if present, as strptime struggles with 'Z' or HH'mm'
+                        if 'Z' in date_str: date_str = date_str.replace('Z', '')
+                        if '+' in date_str: date_str = date_str.split('+')[0]
+                        # Correctly handle '-' which might be part of date or TZ separator for negative offsets
+                        # Only split by '-' if it's followed by digits and likely a TZ offset
+                        if '-' in date_str and len(date_str.split('-')[-1]) <= 4 and date_str.split('-')[-1].isdigit():
+                             date_str = date_str.split('-')[0]
+                        else: # if '-' is part of date, don't split or handle carefully
+                            # This simplified parser might still struggle with complex date strings with internal hyphens
+                            pass 
+                        # Ensure we only take the YYYYMMDDHHMMSS part
+                        date_str_core = date_str[:14]
+                        dt_obj = datetime.strptime(date_str_core, "%Y%m%d%H%M%S")
+                        metadata[str(key)] = dt_obj.isoformat()
+                    except ValueError:
+                        metadata[str(key)] = str(value) # Store as string if parsing fails
+                else:
+                    metadata[str(key)] = str(value)
+            results['docinfo_metadata'] = metadata
+        else:
+            results['docinfo_metadata'] = "Not found or not a dictionary."
     except Exception as e_meta:
         results['docinfo_metadata_error'] = str(e_meta)
     
     try:
-        if pdf.xmp_metadata:
+        # XMP metadata is typically in pdf.Root.Metadata (a stream)
+        xmp_stream = pdf.Root.get('/Metadata')
+        if isinstance(xmp_stream, pikepdf.Stream):
             results['xmp_metadata_present'] = True
+            # To get content: xmp_content = xmp_stream.read_bytes().decode('utf-8', errors='replace')
+            # For now, just indicate presence.
         else:
             results['xmp_metadata_present'] = False
     except Exception as e_xmp:
         results['xmp_metadata_check_error'] = str(e_xmp)
         results['xmp_metadata_present'] = 'Error checking'
 
-    pdf.close() 
+    pdf.close() # Close the pikepdf object
     return results
 
 # ------------------------------------------------------------------
 # Helper — Second layer: LLM-based content anomaly detection
 # ------------------------------------------------------------------
 
+from pydantic import BaseModel, Field
+from openai import OpenAI
+
+class AnomalyDetail(BaseModel):
+    type: str = Field(description="Category for the anomaly (e.g., 'Inconsistency', 'Suspicious Language', 'Abrupt Tone Shift', 'Unusual Formatting/Structure Hint', 'Potential Misinformation')")
+    description: str = Field(description="Detailed explanation of the anomaly.")
+    excerpt: Optional[str] = Field(None, description="Relevant snippet from the text where the anomaly was observed (if applicable).")
+
+class ContentAnalysis(BaseModel):
+    overall_assessment: str = Field(description="Brief summary of findings (e.g., 'No significant anomalies detected', 'Minor inconsistencies noted', 'Potential red flags identified').")
+    detected_anomalies: List[AnomalyDetail] = Field(description="List of specific anomalies found. Empty if none.")
+    confidence_score: float = Field(description="Numerical score from 0.0 to 1.0 indicating confidence in the assessment.", ge=0.0, le=1.0)
+
 def run_second_layer(pdf_bytes: bytes) -> dict:
     """Analyze PDF text content for anomalies using an LLM."""
-    md = MarkItDown()
-    results = {}
+    results = {
+        "llm_analysis": None,
+        "llm_analysis_error": None
+    }
+    api_key = st.session_state.get("XAI_API_KEY")
+
+    if not api_key:
+        results['llm_analysis_error'] = "API key not configured. Skipping LLM analysis."
+        return results
 
     try:
-        # 1. Extract text content using MarkItDown
-        # Ensure MarkItDown().convert_stream expects bytes for the stream
-        # If it expects a file-like object with read(), use io.BytesIO
-        pdf_stream = io.BytesIO(pdf_bytes)
-        extracted_text = md.convert_stream(pdf_stream)
-        results['text_extraction_successful'] = True
-        if not extracted_text.strip():
-            results['text_extraction_successful'] = False
-            results['llm_analysis'] = {
-                'overall_assessment': 'No text extracted from PDF.',
-                'detected_anomalies': [],
-                'confidence_score': 0.0,
-                'error': 'No text content could be extracted for LLM analysis.'
-            }
+        md = MarkItDown(enable_plugins=False)
+        with io.BytesIO(pdf_bytes) as pdf_stream:
+            # convert_stream returns a DocumentConverterResult object
+            conversion_result = md.convert_stream(pdf_stream)
+            # The actual text is in the .text_content attribute
+            extracted_text = conversion_result.text_content 
+
+        if not extracted_text or not extracted_text.strip():
+            results['llm_analysis_error'] = "Extracted text is empty. Skipping LLM analysis."
             return results
-    except Exception as e:
-        results['text_extraction_successful'] = False
-        results['llm_analysis'] = {
-            'overall_assessment': 'Error during text extraction.',
-            'detected_anomalies': [],
-            'confidence_score': 0.0,
-            'error': f"Failed to extract text: {str(e)}"
-        }
+
+    except Exception as e_text_extract:
+        st.error(f"Error during text extraction: {e_text_extract}")
+        results['llm_analysis_error'] = f"Failed to extract text: {e_text_extract}"
         return results
 
-    # 2. LLM Analysis
-    api_key = st.session_state.get("XAI_API_KEY") or os.getenv("GROK_API_KEY")
-    if not api_key:
-        results['llm_analysis'] = {
-            'overall_assessment': 'API Key missing.',
-            'detected_anomalies': [],
-            'confidence_score': 0.0,
-            'error': 'Provide an x.ai API key in the sidebar for content analysis.'
-        }
-        return results
-
+    # Simplified system prompt for structured output
     system_prompt = (
-        "You are a forensic document analyst. Your task is to review the provided text content "
-        "extracted from a PDF document and identify any potential anomalies, inconsistencies, or "
-        "red flags that might suggest the document has been altered, contains misleading information, "
-        "or exhibits unusual characteristics. Provide your findings in a structured JSON format. "
-        "The JSON should include a main key 'content_analysis' which is an object. This object should contain:"
-        "- 'overall_assessment': A brief summary (e.g., 'No significant anomalies detected', 'Minor inconsistencies noted', 'Potential red flags identified')."
-        "- 'detected_anomalies': A list of objects, where each object describes a specific anomaly found. Each anomaly object should have:"
-        "    - 'type': A category for the anomaly (e.g., 'Inconsistency', 'Suspicious Language', 'Abrupt Tone Shift', 'Unusual Formatting/Structure Hint', 'Potential Misinformation')."
-        "    - 'description': A detailed explanation of the anomaly."
-        "    - 'excerpt': A relevant snippet from the text where the anomaly was observed (if applicable)."
-        "- 'confidence_score': A numerical score from 0.0 to 1.0 indicating your confidence in the assessment, where 1.0 is high confidence."
-        "If no anomalies are found, 'detected_anomalies' should be an empty list and 'overall_assessment' should reflect this."
+        "You are a forensic document analyst. Analyze the provided text extracted from a PDF document. "
+        "Identify any anomalies such as internal inconsistencies, suspicious language or claims, "
+        "abrupt changes in tone or style, unusual formatting hints (based on this text), "
+        "or potential misinformation. Provide your analysis according to the defined schema."
     )
 
-    payload = {
-        "model": "grok-3", # Or your preferred model
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": extracted_text},
-        ],
-        "temperature": 0.2, # Low temperature for more factual/less creative analysis
-        "max_tokens": 1500, # Adjust as needed
-        "response_format": {"type": "json_object"} # Request JSON output if API supports it
-    }
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.x.ai/v1", # Ensure this is the correct base URL for x.ai Grok
+    )
+
+    raw_response_for_debug = None
 
     try:
-        resp = requests.post(
-            "https://api.x.ai/v1/chat/completions", # Ensure this is the correct endpoint
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=120, # Increased timeout for potentially longer analysis
+        completion = client.beta.chat.completions.parse(
+            model="grok-3", # Using grok-3 as it supports structured outputs
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": extracted_text},
+            ],
+            response_format=ContentAnalysis, # Pass the Pydantic model here
+            temperature=0.2,
+            max_tokens=2000, 
+            timeout=180,
         )
-        resp.raise_for_status()
-        llm_response_json = resp.json()
         
-        # Expecting the LLM to return JSON directly in the 'content' of the message
-        # or as the top-level response if response_format is well-supported by the model/API
-        if llm_response_json.get("choices") and llm_response_json["choices"][0].get("message"): 
-            content_str = llm_response_json["choices"][0]["message"].get("content")
-            if content_str:
-                try:
-                    # The content itself should be the JSON string we asked for
-                    parsed_content = json.loads(content_str)
-                    # Ensure it has the 'content_analysis' key we specified in the prompt
-                    if 'content_analysis' in parsed_content:
-                        results['llm_analysis'] = parsed_content['content_analysis']
-                    else:
-                        # Fallback if the LLM didn't structure it with 'content_analysis' as the root
-                        results['llm_analysis'] = {
-                            'overall_assessment': 'LLM response format unexpected.',
-                            'detected_anomalies': [],
-                            'confidence_score': 0.0,
-                            'raw_response': parsed_content,
-                            'error': 'LLM did not return the expected JSON structure with content_analysis key.'
-                        }
-                except json.JSONDecodeError as json_e:
-                    results['llm_analysis'] = {
-                        'overall_assessment': 'LLM response not valid JSON.',
-                        'detected_anomalies': [],
-                        'confidence_score': 0.0,
-                        'raw_response': content_str,
-                        'error': f"Failed to parse LLM JSON response: {str(json_e)}"
-                    }
-            else:
-                 results['llm_analysis'] = {
-                    'overall_assessment': 'LLM returned empty content.',
-                    'detected_anomalies': [],
-                    'confidence_score': 0.0, 
-                    'error': 'LLM response content was empty.'
-                }
+        # The response is already a Pydantic model instance
+        if completion.choices and completion.choices[0].message and completion.choices[0].message.parsed:
+            llm_analysis_data = completion.choices[0].message.parsed
+            # Convert Pydantic model to dict for consistent storage/display in results
+            results['llm_analysis'] = llm_analysis_data.model_dump() 
         else:
-            results['llm_analysis'] = {
-                'overall_assessment': 'LLM response structure unexpected.',
-                'detected_anomalies': [],
-                'confidence_score': 0.0, 
-                'raw_response': llm_response_json, 
-                'error': 'LLM response did not contain expected choices or message structure.'
-            }
+            results['llm_analysis_error'] = "LLM response was empty or not structured as expected."
+            # Attempt to get raw response if possible for debugging
+            try: raw_response_for_debug = completion.model_dump_json(indent=2) 
+            except: pass
 
-    except requests.exceptions.RequestException as req_e:
-        results['llm_analysis'] = {
-            'overall_assessment': 'API Request Error.',
-            'detected_anomalies': [],
-            'confidence_score': 0.0,
-            'error': f"Error calling LLM API: {str(req_e)}"
-        }
-    except Exception as e:
-        results['llm_analysis'] = {
-            'overall_assessment': 'LLM Analysis Error.',
-            'detected_anomalies': [],
-            'confidence_score': 0.0,
-            'error': f"An unexpected error occurred during LLM analysis: {str(e)}"
-        }
+    except Exception as e_llm: # Catching broader exceptions from the OpenAI SDK call
+        st.error(f"Error during LLM analysis: {e_llm}")
+        results['llm_analysis_error'] = f"LLM analysis failed: {e_llm}"
+        # Attempt to get raw response if it's an API error with a response body
+        if hasattr(e_llm, 'response') and hasattr(e_llm.response, 'text'):
+            raw_response_for_debug = e_llm.response.text[:2000]
+        elif hasattr(e_llm, 'message'):
+             raw_response_for_debug = str(e_llm.message)[:2000]
+        else:
+            raw_response_for_debug = str(e_llm)[:2000]
+    
+    if raw_response_for_debug and results['llm_analysis_error']:
+        results['raw_llm_response_for_debug'] = raw_response_for_debug
+
     return results
-
-# ------------------------------------------------------------------
-# Tool‑description string (for other LLMs)
-# ------------------------------------------------------------------
-
-tool_description = """PDF Integrity Checker — Two‑Layer Tamper Detection Tool\n\nInput: A PDF file.\nProcess:\n  1. Layer 1 — cryptographic/structural checks: SHA‑256 hash compare,\n     incremental‑save detection, digital‑signature validation.\n  2. Layer 2 — semantic diff: earliest vs latest revision converted to\n     Markdown with Microsoft MarkItDown, analysed by Grok 3 for material\n     content changes.\nOutput: JSON report\n  {\n    \"layer1\": { ... Positive/Negative flags ... },\n    \"layer2\": {\n        \"changes_detected\": Positive|Negative,\n        \"grok_response\": (raw)\n    }\n  }\nPositive => indications the PDF WAS altered;\nNegative => no evidence of tampering detected.\n"""
-
 # ------------------------------------------------------------------
 # Streamlit UI
 # ------------------------------------------------------------------
