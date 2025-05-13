@@ -84,7 +84,7 @@ def run_first_layer(pdf_bytes: bytes, reference_hash: str | None = None) -> dict
         results["hash_mismatch"] = "N/A (no reference)"
 
     # 2 — Incremental revision check
-    pdf = pikepdf.open(io.BytesIO(pdf_bytes), allow_overlays=True)
+    pdf = pikepdf.open(io.BytesIO(pdf_bytes))
     revisions = len(pdf.get_revisions())
     results["multiple_revisions"] = "Positive" if revisions > 1 else "Negative"
 
@@ -111,7 +111,7 @@ def run_first_layer(pdf_bytes: bytes, reference_hash: str | None = None) -> dict
 
 def run_second_layer(pdf_bytes: bytes) -> dict:
     md = MarkItDown()
-    pdf = pikepdf.open(io.BytesIO(pdf_bytes), allow_overlays=True)
+    pdf = pikepdf.open(io.BytesIO(pdf_bytes))
     revs = pdf.get_revisions()
 
     if len(revs) < 2:
