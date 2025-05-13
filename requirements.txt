@@ -1,6 +1,6 @@
 streamlit>=1.34
 pikepdf>=9.0           # wheels bundle libqpdf on most platforms
-markitdown[all]>=0.2.1
+markitdown[all]
 requests>=2.31
 # pyHanko doesn't ship wheels for Python 3.13 (yet).
 # Pin <3.13 or install conditionally:
