@@ -1,37 +1,3 @@
-# ---------------------------------------------
-# app.py  (Streamlit Web App for PDF Integrity)
-# ---------------------------------------------
-"""
-PDF Integrity Checker — two‑layer tamper detection
-=================================================
-
-**Layer 1 – Cryptographic / structural**
-  • SHA‑256 mismatch vs optional reference hash  
-  • Incremental‑save detection (pikepdf)  
-  • Digital‑signature validation (pyHanko)  
-
-**Layer 2 – Semantic diff**  
-The earliest and latest PDF revisions are converted to Markdown with
-**Microsoft MarkItDown**, then a *single* Grok 3 call returns
-`{"altered": true|false}`.
-
-Changes in this version
------------------------
-* Adds a **sidebar API‑key field** (`Grok 3 API key`) stored in
-  `st.session_state` for the current browser session – no need for an
-  environment variable on Heroku.
-* Provides an **LLM‑ready description** (`tool_description`) that users can
-  copy‑paste when they need to tell another LLM what this app does.
-
-Deployment reminder (Heroku)
-----------------------------
-```
-web: streamlit run app.py --server.port=$PORT --server.enableCORS=false
-```
-
-`requirements.txt` additions remain identical to the previous version.
-"""
-
 import hashlib
 import io
 import json
@@ -67,19 +33,14 @@ except ImportError:
 # ------------------------------------------------------------------
 
 def sidebar_config():
-    st.sidebar.header("⚙️ Configuration")
-    api_key = st.sidebar.text_input(
-        "Grok 3 API key (x.ai)",
+    st.sidebar.title("⚙️ Configuration")
+    st.session_state.XAI_API_KEY = st.sidebar.text_input(
+        "Grok API Key (x.ai)",
         type="password",
-        key="xai_key",
-        placeholder="sk‑...",
+        value=st.session_state.get("XAI_API_KEY") or os.getenv("GROK_API_KEY") or "",
+        help="API key for x.ai's Grok model, used for Layer 2 content analysis."
     )
-    reference_hash = st.sidebar.text_input("Known good SHA‑256 (optional)")
-
-    # Store key in session_state for easy access downstream.
-    if api_key:
-        st.session_state["XAI_API_KEY"] = api_key
-    return reference_hash
+    return None
 
 # ------------------------------------------------------------------
 # Helper — First layer: cryptographic / structural integrity
