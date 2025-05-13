@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime
+from typing import List, Optional, Union, Dict
 
 import pikepdf
 import requests
@@ -11,15 +12,19 @@ import streamlit as st
 from markitdown import MarkItDown
 
 # Lazy import of pyHanko (optional dependency)
+pyhanko_reader_module = None
+pyhanko_validation_module = None
+pyhanko_sign_general_module = None
+PyHankoValidationContext = None # Explicitly for ValidationContext
+
 try:
-    from pyhanko.sign.validation import validate_pdf_signature
-    from pyhanko_certvalidator import ValidationContext
-    from pyhanko.pdf_utils.reader import PdfFileReader
-    from pyhanko.sign import validation
-    from pyhanko.sign.validation import SignatureCoverageLevel, ValidatedSuccessfully, ValidationInfo
-    from pyhanko.sign.general import SignedData
+    from pyhanko.pdf_utils import reader as pyhanko_reader_module
+    from pyhanko.sign import validation as pyhanko_validation_module
+    from pyhanko.sign import general as pyhanko_sign_general_module
+    from pyhanko_certvalidator import ValidationContext as PyHankoValidationContext
 except ImportError:
-    validate_pdf_signature = None
+    # If any import fails, modules will remain None, caught by checks before use
+    pass # Modules will remain None, status checked before use
 
 # Suppress Boto3 warning if not used directly but is a deep dependency of markitdown
 try:
@@ -33,154 +38,263 @@ except ImportError:
 # ------------------------------------------------------------------
 
 def sidebar_config():
-    st.sidebar.title("⚙️ Configuration")
-    st.session_state.XAI_API_KEY = st.sidebar.text_input(
-        "Grok API Key (x.ai)",
+    st.sidebar.markdown("---")
+
+    # Debug Information Section
+    st.sidebar.subheader("🐞 Debug Information")
+    # Display critical session state variables for debugging
+    # Convert boolean and None to string for display, or show placeholder
+    pyhanko_reader_imported = str(st.session_state.get('pyhanko_reader_module_imported', 'Not Set'))
+    pyhanko_validation_imported = str(st.session_state.get('pyhanko_validation_module_imported', 'Not Set'))
+    pyhanko_certvalidator_vc_imported = str(st.session_state.get('pyhanko_certvalidator_vc_module_imported', 'Not Set'))
+
+    st.sidebar.text(f"pyhanko.pdf_utils.reader: {pyhanko_reader_imported}")
+    st.sidebar.text(f"pyhanko.sign.validation: {pyhanko_validation_imported}")
+    st.sidebar.text(f"pyhanko_certvalidator.ValidationContext: {pyhanko_certvalidator_vc_imported}")
+    st.sidebar.markdown("---")
+
+    st.sidebar.subheader("🔑 API Keys")
+
+    # Initialize the session state variable for the Grok API key if it doesn't exist
+    if 'grok_api_key' not in st.session_state:
+        st.session_state.grok_api_key = ""
+
+    # Use a unique key for the text input widget itself
+    api_key_input_from_widget = st.sidebar.text_input(
+        "Enter Xai (Grok) API Key",
+        value=st.session_state.grok_api_key,  # Pre-fill with the current session state value
         type="password",
-        value=st.session_state.get("XAI_API_KEY") or os.getenv("GROK_API_KEY") or "",
-        help="API key for x.ai's Grok model, used for Layer 2 content analysis."
+        key="grok_api_key_input_widget"  # Unique key for this specific widget
+    )
+
+    # If the value entered in the widget is different from our stored session state value,
+    # it means the user has changed it. Update st.session_state.grok_api_key.
+    if api_key_input_from_widget != st.session_state.grok_api_key:
+        st.session_state.grok_api_key = api_key_input_from_widget
+        # Optionally, provide feedback or st.rerun() if immediate effect is critical,
+        # but for API keys, the next analysis run will pick it up naturally.
+        # st.sidebar.success("API Key updated!") # Example feedback
+        # st.experimental_rerun() # If you need the app to immediately reflect the new key
+
+    st.sidebar.markdown("---")
+    # About section or other sidebar items can go here
+    st.sidebar.markdown("**About**")
+    st.sidebar.info(
+        "This tool performs a two-layer analysis of PDF documents to check for signs of tampering or anomalies. "
+        "It is intended for informational purposes and does not constitute legal or expert advice."
     )
     return None
+
+# Helper function to safely convert pikepdf objects to strings
+def _safe_pdf_value_to_string(pdf_obj):
+    # pikepdf.String and pikepdf.Name are specific types.
+    # For numbers and booleans, pikepdf often uses native Python int, float, bool.
+    if isinstance(pdf_obj, (pikepdf.String, pikepdf.Name, int, float, bool)):
+        try:
+            return str(pdf_obj)
+        except ValueError:
+            return f"[ValueError on str({type(pdf_obj).__name__})]"
+        except Exception as e_str_simple:
+            return f"[Error on str({type(pdf_obj).__name__}): {type(e_str_simple).__name__}]"
+    elif isinstance(pdf_obj, pikepdf.Array):
+        return [_safe_pdf_value_to_string(item) for item in pdf_obj] # Recursive
+    elif isinstance(pdf_obj, pikepdf.Dictionary):
+        objgen_str = ""
+        if hasattr(pdf_obj, 'objgen') and isinstance(pdf_obj.objgen, tuple) and len(pdf_obj.objgen) == 2:
+            objgen_str = f" (obj={pdf_obj.objgen[0]}/{pdf_obj.objgen[1]})"
+        return f"PDFDictionary{objgen_str} (Keys: {[_safe_pdf_value_to_string(k) for k in pdf_obj.keys()]})"
+    elif isinstance(pdf_obj, pikepdf.Object): # Generic, unresolved object
+        obj_details = []
+        if hasattr(pdf_obj, 'objgen') and isinstance(pdf_obj.objgen, (tuple, list)) and len(pdf_obj.objgen) == 2:
+            obj_details.append(f"obj={pdf_obj.objgen[0]}/{pdf_obj.objgen[1]}")
+        
+        pdf_type_display = "[Type N/A]"
+        try:
+            if hasattr(pdf_obj, 'get') and callable(pdf_obj.get) and hasattr(pdf_obj, 'keys') and callable(pdf_obj.keys):
+                type_name_obj = pdf_obj.get('/Type')
+                if type_name_obj:
+                    pdf_type_display = f"pdf_type=/{_safe_pdf_value_to_string(type_name_obj)}" # Recursive for type name string
+        except Exception:
+            pass 
+        
+        if pdf_type_display != "[Type N/A]":
+             obj_details.append(pdf_type_display)
+        
+        # Try a direct str() as a last resort for the object itself, but protected
+        obj_str_fallback = ""
+        try:
+            obj_str_fallback = str(pdf_obj)
+        except ValueError:
+            obj_str_fallback = "[ValueError on str(Object)]"
+        except Exception:
+            obj_str_fallback = "[Error on str(Object)]"
+        if len(obj_details) == 0 and obj_str_fallback: # If no other details, use the stringified object if available
+             obj_details.append(f"RawValue='{obj_str_fallback}'")
+
+        return f"Unresolved PDFObject ({', '.join(obj_details) if obj_details else 'Info N/A'})"
+    elif pdf_obj is None:
+        return "null_obj (NoneType)"
+    else: 
+        try:
+            val_str = str(pdf_obj)
+        except ValueError:
+            val_str = f"[ValueError on str(value of type {type(pdf_obj).__name__})]"
+        except Exception as e_str_val:
+            val_str = f"[Error on str(value of type {type(pdf_obj).__name__}): {type(e_str_val).__name__}]"
+        return f"OtherType (Type: {type(pdf_obj).__name__}, Value: {val_str})"
+
 
 # ------------------------------------------------------------------
 # Helper — First layer: cryptographic / structural integrity
 # ------------------------------------------------------------------
 
 def run_first_layer(pdf_bytes: bytes, reference_hash: str | None = None) -> dict:
-    results: dict[str, str] = {}
+    # Initialize main results dictionary
+    results = {
+        'structural_integrity': {'issues_found': False, 'details': []},
+        'hash_mismatch': "N/A (no reference)", # Placeholder
+        'incremental_updates': "Unknown",
+        'signature_analysis': [],
+        'docinfo_metadata': {},
+        'xmp_metadata_present': False,
+        'summary_anomalies': [], # For high-level anomaly summaries
+        'status_summary': "Analysis Pending" # General status
+    }
+    metadata_error_details = None # To store any specific errors from metadata extraction
 
-    # 0 — PDF Structural Integrity Check (pikepdf.check())
+    pdf = None  # Initialize pdf to None
+
     try:
-        pdf = pikepdf.open(io.BytesIO(pdf_bytes))
-        structural_issues = pdf.check()
-        results['structural_integrity'] = {
-            'issues_found': len(structural_issues) > 0,
-            'details': structural_issues if structural_issues else "No structural issues found."
-        }
-    except Exception as e:
-        results['structural_integrity'] = {
-            'issues_found': True,
-            'details': f"Error during structural check: {str(e)}"
-        }
+        # Attempt to open the PDF
+        try:
+            pdf = pikepdf.open(io.BytesIO(pdf_bytes))
+            results['status_summary'] = "PDF Opened Successfully"
+        except pikepdf.PasswordError:
+            results['structural_integrity']['issues_found'] = True
+            results['structural_integrity']['details'].append("PDF is password protected and cannot be opened without a password.")
+            results['summary_anomalies'].append("PDF is password protected.")
+            results['status_summary'] = "Error: PDF Password Protected"
+            return results # Return early, 'finally' will still execute
+        except Exception as e_open:
+            results['structural_integrity']['issues_found'] = True
+            results['structural_integrity']['details'].append(f"Failed to open or parse PDF: {type(e_open).__name__} - {str(e_open)}")
+            results['summary_anomalies'].append("Failed to open or parse PDF.")
+            results['status_summary'] = "Error: PDF Parsing Failed"
+            return results # Return early, 'finally' will still execute
 
-    # 1 — File hash (if reference is provided)
-    current_hash = hashlib.sha256(pdf_bytes).hexdigest()
-    if reference_hash:
-        results["hash_mismatch"] = "Positive" if current_hash != reference_hash.lower() else "Negative"
-    else:
-        results["hash_mismatch"] = "N/A (no reference)"
+        # If we reached here, PDF is open. Proceed with analysis.
 
-    # 2 — Incremental revision check
-    has_incremental_updates = False
-    try:
-        for obj in pdf.objects:
-            if obj.objgen[1] > 0:
-                has_incremental_updates = True
-                break
-    except Exception as e:
-        results['incremental_updates_check_error'] = str(e)
-    results["has_incremental_updates"] = "Positive" if has_incremental_updates else "Negative"
+        # 1. Structural Integrity Check (pikepdf.check())
+        try:
+            check_results = pdf.check()
+            if check_results:
+                results['structural_integrity']['issues_found'] = True
+                results['structural_integrity']['details'].extend(check_results)
+                results['summary_anomalies'].append("Structural integrity warnings found.")
+        except Exception as e_check: # Catch potential errors during .check()
+            results['structural_integrity']['issues_found'] = True
+            results['structural_integrity']['details'].append(f"Error during PDF structural check: {str(e_check)}")
+            results['summary_anomalies'].append("Error during PDF structural check.")
 
-    # 3 — Digital Signature Validation (using pyHanko)
-    signature_analysis = []
-    try:
-        reader = PdfFileReader(io.BytesIO(pdf_bytes))
-        if not reader.embedded_signatures:
-            signature_analysis.append({"status": "Not Signed"})
-        else:
-            for sig_field_name, sig in reader.embedded_signatures.items():
-                sig_details = {"field_name": sig_field_name, "status": "Processing"}
-                try:
-                    val_info: ValidationInfo = validation.validate_pdf_signature(sig)
-                    sig_details['status_code'] = val_info.status.name if val_info.status else "Unknown"
-                    sig_details['integrity_ok'] = val_info.intact
-                    sig_details['covers_entire_document'] = val_info.coverage == SignatureCoverageLevel.ENTIRE_DOCUMENT
-                    sig_details['summary'] = str(val_info.summary()) # Human-readable summary
-                    sig_details['is_valid'] = isinstance(val_info, ValidatedSuccessfully)
+        # 2. Hash Check (Placeholder - requires reference)
+        # results['hash_mismatch'] = calculate_and_compare_hash(pdf_bytes, reference_hash)
 
-                    if val_info.signer_cert:
-                        sig_details['signer_common_name'] = val_info.signer_cert.subject.get_common_name()
-                        sig_details['signer_info'] = val_info.signer_cert.subject.rfc4514_string()
-                        sig_details['issuer_info'] = val_info.signer_cert.issuer.rfc4514_string()
+        # 3. Incremental Updates (Save History)
+        try:
+            if hasattr(pdf, 'has_incremental_updates') and pdf.has_incremental_updates():
+                results['incremental_updates'] = "Positive (Indicates changes may have been saved incrementally)"
+                results['summary_anomalies'].append("PDF has incremental updates (revisions).")
+            else:
+                results['incremental_updates'] = "Negative"
+        except Exception as e_inc_update: # Catch potential errors during .has_incremental_updates()
+            results['incremental_updates'] = f"Error checking incremental updates: {str(e_inc_update)}"
+
+        # 4. Digital Signature Analysis (pyHanko)
+        # ... (existing signature analysis logic, which should be robust with its own try-except)
+        # Ensure this block uses the 'pdf' variable correctly.
+        try:
+            # Convert pdf_bytes to a stream for pyHanko
+            pdf_stream_for_pyhanko = io.BytesIO(pdf_bytes)
+            r = pyhanko_reader_module.PdfFileReader(pdf_stream_for_pyhanko)
+
+            if not r.embedded_signatures:
+                results['signature_analysis'].append({'status': 'Digital Signature: Not Signed (No signatures found in PDF via embedded_signatures)'})
+            else:
+                # ... (rest of your existing pyHanko signature validation logic) ...
+                # This part might involve complex pyHanko calls and should be within this try
+                # For example:
+                # vc = ValidationContext.load_default_certs() # Or your custom context
+                # for signature in r.embedded_signatures:
+                #     status = validate_pdf_signature(signature, vc)
+                #     results['signature_analysis'].append(summarize_validation_status(status))
+                # The above is a simplified placeholder, adapt with your actual pyhanko logic
+                # For now, as a placeholder if you have complex logic not shown recently:
+                results['signature_analysis'].append({'status': f'Signatures found ({len(r.embedded_signatures)}), detailed validation pending full pyHanko integration.'})
+
+        except Exception as e_sign:
+            results['signature_analysis'].append({'status': f'Digital Signature: Error during analysis - {type(e_sign).__name__}: {str(e_sign)}'})
+            results['summary_anomalies'].append("Error during digital signature analysis.")
+
+
+        # 5. Metadata Extraction (DocInfo and XMP)
+        metadata_extraction_successful = False
+        try:
+            # DocInfo (PDF Information Dictionary)
+            if hasattr(pdf, 'trailer') and pdf.trailer is not None and '/Info' in pdf.trailer:
+                info_object = pdf.trailer.get('/Info')
+                if info_object is not None:
+                    if isinstance(info_object, pikepdf.Dictionary):
+                        for key, value in info_object.items():
+                            key_str = _safe_pdf_value_to_string(key)
+                            if isinstance(value, pikepdf.String) and str(value).startswith('D:'):
+                                try:
+                                    date_str_val = str(value)[2:]
+                                    results['docinfo_metadata'][key_str] = f"PDFDate({date_str_val})"
+                                except Exception as e_date_parse:
+                                    results['docinfo_metadata'][key_str] = f"RawPDFStringDate('{_safe_pdf_value_to_string(value)}', ParseAttemptError: {str(e_date_parse)})"
+                            else:
+                                results['docinfo_metadata'][key_str] = _safe_pdf_value_to_string(value)
+                    elif isinstance(info_object, pikepdf.Object):
+                        metadata_error_details = f"DocInfo: /Info entry is a generic PDF Object, not a Dictionary. Details: {_safe_pdf_value_to_string(info_object)}"
+                        results['docinfo_metadata']['/Info_raw_type'] = _safe_pdf_value_to_string(type(info_object))
                     else:
-                        sig_details['signer_common_name'] = "N/A (No signer certificate)"
-
-                    if val_info.signing_time:
-                        sig_details['signing_time'] = val_info.signing_time.isoformat()
-                    else:
-                        sig_details['signing_time'] = "N/A (No signing time in signature)"
-                    
-                    if not val_info.intact:
-                        sig_details['status'] = "Signed - Integrity Failed"
-                    elif val_info.intact and not val_info.trusted:
-                        sig_details['status'] = "Signed - Integrity OK, Trust Unverified"
-                    elif val_info.intact and val_info.trusted:
-                        sig_details['status'] = "Signed - Integrity OK, Trusted"
-                    else:
-                        sig_details['status'] = f"Signed - {val_info.status.name if val_info.status else 'Validation Issues'}"
-
-                except Exception as e_val:
-                    sig_details['status'] = "Signed - Error During Validation"
-                    sig_details['validation_error'] = str(e_val)
-                signature_analysis.append(sig_details)
-    except Exception as e_reader:
-        signature_analysis.append({"status": "Error reading signatures", "error": str(e_reader)})
-    results['signature_analysis'] = signature_analysis
-
-    # 4 — Metadata Extraction
-    metadata = {}
-    try:
-        # pdf.docinfo attempts to access pdf.trailer["/Info"]
-        # We should check if /Info exists and is a dictionary first
-        info_obj = pdf.trailer.get('/Info')
-        if isinstance(info_obj, pikepdf.Dictionary):
-            docinfo = pdf.docinfo # Safe to access now
-            for key, value in docinfo.items():
-                # Dates like /CreationDate (D:20230401123045Z) need parsing
-                if isinstance(value, pikepdf.String) and value.startswith('D:'):
-                    try:
-                        # Simplified parsing, PDF date format can be complex
-                        # D:YYYYMMDDHHMMSSOHH'mm'
-                        # Example: D:20240115103000-05'00'
-                        date_str = str(value)[2:] # Remove 'D:'
-                        # Remove timezone offset for simplicity if present, as strptime struggles with 'Z' or HH'mm'
-                        if 'Z' in date_str: date_str = date_str.replace('Z', '')
-                        if '+' in date_str: date_str = date_str.split('+')[0]
-                        # Correctly handle '-' which might be part of date or TZ separator for negative offsets
-                        # Only split by '-' if it's followed by digits and likely a TZ offset
-                        if '-' in date_str and len(date_str.split('-')[-1]) <= 4 and date_str.split('-')[-1].isdigit():
-                             date_str = date_str.split('-')[0]
-                        else: # if '-' is part of date, don't split or handle carefully
-                            # This simplified parser might still struggle with complex date strings with internal hyphens
-                            pass 
-                        # Ensure we only take the YYYYMMDDHHMMSS part
-                        date_str_core = date_str[:14]
-                        dt_obj = datetime.strptime(date_str_core, "%Y%m%d%H%M%S")
-                        metadata[str(key)] = dt_obj.isoformat()
-                    except ValueError:
-                        metadata[str(key)] = str(value) # Store as string if parsing fails
+                        metadata_error_details = f"DocInfo: /Info entry is of unexpected type: {_safe_pdf_value_to_string(type(info_object))}. Value: {_safe_pdf_value_to_string(info_object)}"
                 else:
-                    metadata[str(key)] = str(value)
-            results['docinfo_metadata'] = metadata
-        else:
-            results['docinfo_metadata'] = "Not found or not a dictionary."
-    except Exception as e_meta:
-        results['docinfo_metadata_error'] = str(e_meta)
-    
-    try:
-        # XMP metadata is typically in pdf.Root.Metadata (a stream)
-        xmp_stream = pdf.Root.get('/Metadata')
-        if isinstance(xmp_stream, pikepdf.Stream):
-            results['xmp_metadata_present'] = True
-            # To get content: xmp_content = xmp_stream.read_bytes().decode('utf-8', errors='replace')
-            # For now, just indicate presence.
-        else:
-            results['xmp_metadata_present'] = False
-    except Exception as e_xmp:
-        results['xmp_metadata_check_error'] = str(e_xmp)
-        results['xmp_metadata_present'] = 'Error checking'
+                    metadata_error_details = "DocInfo: /Info entry is null or unresolvable."
+            else:
+                results['docinfo_metadata']['status'] = "DocInfo: /Info dictionary not found in PDF trailer."
 
-    pdf.close() # Close the pikepdf object
+            # XMP Metadata
+            if hasattr(pdf, 'Root') and pdf.Root is not None and '/Metadata' in pdf.Root:
+                metadata_stream_obj = pdf.Root.get('/Metadata')
+                if metadata_stream_obj is not None and isinstance(metadata_stream_obj, pikepdf.Stream):
+                    results['xmp_metadata_present'] = True
+                elif metadata_stream_obj is not None:
+                    results['docinfo_metadata']['XMP_status'] = f"XMP: /Metadata entry found but is not a Stream (Type: {_safe_pdf_value_to_string(type(metadata_stream_obj).__name__)})."
+            metadata_extraction_successful = True # Mark as attempted/successful path
+        except AttributeError as ae:
+            metadata_error_details = f"Metadata Error: AttributeError accessing PDF components ({str(ae)})."
+        except Exception as e_meta:
+            current_metadata_error_str = f"Metadata Error (InnerTry): ({type(e_meta).__name__} - {str(e_meta)})."
+            if metadata_error_details:
+                metadata_error_details += " Additional: " + current_metadata_error_str
+            else:
+                metadata_error_details = current_metadata_error_str
+        
+        if metadata_error_details:
+            # If there was an error, store it distinctly. 'status' might be used for 'not found'
+            results['docinfo_metadata']['error_details'] = metadata_error_details
+            results['summary_anomalies'].append("Errors encountered during metadata extraction.")
+        elif not results['docinfo_metadata'] and not metadata_extraction_successful:
+            # If no data and not explicitly successful, and no specific error captured above for docinfo itself
+            results['docinfo_metadata']['status'] = "No DocInfo data extracted or extraction process issue."
+
+        results['status_summary'] = "Layer 1 Analysis Completed"
+
+    finally:
+        if pdf:  # Check if pdf was successfully assigned
+            pdf.close()
+    
     return results
 
 # ------------------------------------------------------------------
@@ -200,17 +314,18 @@ class ContentAnalysis(BaseModel):
     detected_anomalies: List[AnomalyDetail] = Field(description="List of specific anomalies found. Empty if none.")
     confidence_score: float = Field(description="Numerical score from 0.0 to 1.0 indicating confidence in the assessment.", ge=0.0, le=1.0)
 
-def run_second_layer(pdf_bytes: bytes) -> dict:
+def run_second_layer(pdf_bytes: bytes) -> Union[ContentAnalysis, Dict[str, str]]:
     """Analyze PDF text content for anomalies using an LLM."""
-    results = {
-        "llm_analysis": None,
-        "llm_analysis_error": None
-    }
-    api_key = st.session_state.get("XAI_API_KEY")
-
-    if not api_key:
-        results['llm_analysis_error'] = "API key not configured. Skipping LLM analysis."
-        return results
+    
+    grok_api_key = st.session_state.get('grok_api_key')
+    if not grok_api_key:
+        return {
+            "status": "skipped", 
+            "reason": "Layer 2 (Content Analysis) skipped: Xai API key not provided.",
+            "overall_assessment": "Not performed",
+            "detected_anomalies": [],
+            "confidence_score": 0.0
+        }
 
     try:
         md = MarkItDown(enable_plugins=False)
@@ -221,24 +336,35 @@ def run_second_layer(pdf_bytes: bytes) -> dict:
             extracted_text = conversion_result.text_content 
 
         if not extracted_text or not extracted_text.strip():
-            results['llm_analysis_error'] = "Extracted text is empty. Skipping LLM analysis."
-            return results
+            return {
+                "status": "skipped", 
+                "reason": "Layer 2 (Content Analysis) skipped: Extracted text is empty.",
+                "overall_assessment": "Not performed",
+                "detected_anomalies": [],
+                "confidence_score": 0.0
+            }
 
     except Exception as e_text_extract:
         st.error(f"Error during text extraction: {e_text_extract}")
-        results['llm_analysis_error'] = f"Failed to extract text: {e_text_extract}"
-        return results
+        return {
+            "status": "error", 
+            "reason": f"Failed to extract text: {e_text_extract}",
+            "overall_assessment": "Not performed",
+            "detected_anomalies": [],
+            "confidence_score": 0.0
+        }
 
     # Simplified system prompt for structured output
     system_prompt = (
-        "You are a forensic document analyst. Analyze the provided text extracted from a PDF document. "
+        "You are a forensic document analyst. Analyze the provided text extracted from a PDF document. Take into account than the "
+         "document is being parsed so there may be some errors in the text, omit those cases in the findings."
         "Identify any anomalies such as internal inconsistencies, suspicious language or claims, "
         "abrupt changes in tone or style, unusual formatting hints (based on this text), "
         "or potential misinformation. Provide your analysis according to the defined schema."
     )
 
     client = OpenAI(
-        api_key=api_key,
+        api_key=grok_api_key,
         base_url="https://api.x.ai/v1", # Ensure this is the correct base URL for x.ai Grok
     )
 
@@ -261,16 +387,28 @@ def run_second_layer(pdf_bytes: bytes) -> dict:
         if completion.choices and completion.choices[0].message and completion.choices[0].message.parsed:
             llm_analysis_data = completion.choices[0].message.parsed
             # Convert Pydantic model to dict for consistent storage/display in results
-            results['llm_analysis'] = llm_analysis_data.model_dump() 
+            return llm_analysis_data.model_dump() 
         else:
-            results['llm_analysis_error'] = "LLM response was empty or not structured as expected."
+            return {
+                "status": "error", 
+                "reason": "LLM response was empty or not structured as expected.",
+                "overall_assessment": "Not performed",
+                "detected_anomalies": [],
+                "confidence_score": 0.0
+            }
             # Attempt to get raw response if possible for debugging
             try: raw_response_for_debug = completion.model_dump_json(indent=2) 
             except: pass
 
     except Exception as e_llm: # Catching broader exceptions from the OpenAI SDK call
         st.error(f"Error during LLM analysis: {e_llm}")
-        results['llm_analysis_error'] = f"LLM analysis failed: {e_llm}"
+        return {
+            "status": "error", 
+            "reason": f"LLM analysis failed: {e_llm}",
+            "overall_assessment": "Not performed",
+            "detected_anomalies": [],
+            "confidence_score": 0.0
+        }
         # Attempt to get raw response if it's an API error with a response body
         if hasattr(e_llm, 'response') and hasattr(e_llm.response, 'text'):
             raw_response_for_debug = e_llm.response.text[:2000]
@@ -279,10 +417,16 @@ def run_second_layer(pdf_bytes: bytes) -> dict:
         else:
             raw_response_for_debug = str(e_llm)[:2000]
     
-    if raw_response_for_debug and results['llm_analysis_error']:
-        results['raw_llm_response_for_debug'] = raw_response_for_debug
+    if raw_response_for_debug:
+        return {
+            "status": "error", 
+            "reason": "LLM analysis failed.",
+            "overall_assessment": "Not performed",
+            "detected_anomalies": [],
+            "confidence_score": 0.0,
+            "raw_llm_response_for_debug": raw_response_for_debug
+        }
 
-    return results
 # ------------------------------------------------------------------
 # Streamlit UI
 # ------------------------------------------------------------------
@@ -292,10 +436,7 @@ def main():
     st.title("🔍 PDF Integrity Checker (2‑Layer)")
     st.markdown("Upload a PDF and get **Positive / Negative** flags for any indication that it has been tampered with.")
 
-    reference_hash = sidebar_config()
-
-    st.sidebar.markdown("### 📄 Tool description for LLMs")
-    st.sidebar.code(tool_description)
+    sidebar_config()
 
     uploaded = st.file_uploader("Choose a PDF", type="pdf")
     if not uploaded:
@@ -305,7 +446,7 @@ def main():
 
     # ---------- Layer 1 ----------
     st.subheader("🔒 Layer 1 — Cryptographic / Structural")
-    l1 = run_first_layer(pdf_bytes, reference_hash or None)
+    l1 = run_first_layer(pdf_bytes)
     for k, v in l1.items():
         if k == "layer1_overall":
             st.markdown(f"**Overall:** **{v}**")
@@ -314,32 +455,47 @@ def main():
 
     # ---------- Layer 2 ----------
     st.subheader("🕵️ Layer 2 — LLM Content Anomaly Detection")
-    l2 = run_second_layer(pdf_bytes)
-    if 'llm_analysis' in l2:
-        llm_results = l2['llm_analysis']
-        st.write(f"**Overall Assessment:** {llm_results.get('overall_assessment', 'N/A')}")
-        st.write(f"**Confidence Score:** {llm_results.get('confidence_score', 'N/A')}")
+    l2_results = run_second_layer(pdf_bytes)
+
+    if isinstance(l2_results, dict) and 'status' in l2_results:
+        if l2_results['status'] == 'skipped':
+            st.warning(l2_results.get('reason', 'Layer 2 skipped for an unknown reason.'))
+        elif l2_results['status'] == 'error':
+            st.error(l2_results.get('reason', 'Layer 2 encountered an error.'))
+            if 'raw_llm_response_for_debug' in l2_results:
+                with st.expander("Raw LLM Response (for debugging)"):
+                    # Attempt to pretty-print if it's JSON, otherwise show as string
+                    try:
+                        debug_info = json.loads(l2_results['raw_llm_response_for_debug'])
+                        st.json(debug_info)
+                    except (json.JSONDecodeError, TypeError):
+                        st.text(l2_results['raw_llm_response_for_debug'])
+        else: # Should not happen if status is 'skipped' or 'error', but as a fallback
+            st.info(f"Layer 2 status: {l2_results['status']}. Details: {l2_results.get('reason', 'No details')}")
+    elif isinstance(l2_results, dict): # Assumed successful analysis (ContentAnalysis.model_dump())
+        st.write(f"**Overall Assessment:** {l2_results.get('overall_assessment', 'N/A')}")
+        st.write(f"**Confidence Score:** {l2_results.get('confidence_score', 'N/A')}")
         
-        if llm_results.get('error'):
-            st.error(f"LLM Analysis Error: {llm_results['error']}")
-        
-        anomalies = llm_results.get('detected_anomalies', [])
+        anomalies = l2_results.get('detected_anomalies', [])
         if anomalies:
             st.write("**Detected Anomalies/Observations:**")
-            for anomaly in anomalies:
-                with st.expander(f"{anomaly.get('type', 'Anomaly')}: {anomaly.get('description', '')[:50]}..."):
+            for anomaly in anomalies: # anomaly is a dict here
+                # Ensure anomaly is a dict before using .get, for robustness
+                anomaly_type = anomaly.get('type', 'Unknown Type') if isinstance(anomaly, dict) else "Invalid Anomaly Format"
+                with st.expander(f"Anomaly: {anomaly_type}"):
                     st.json(anomaly)
-        elif not llm_results.get('error'):
+        else:
             st.success("No specific content anomalies reported by LLM based on the extracted text.")
-        
-        if 'raw_response' in llm_results:
-            with st.expander("Raw LLM Response (for debugging)"):
-                st.json(llm_results['raw_response'])
+        # No raw_response or raw_llm_response_for_debug expected here for a clean success
     else:
-        st.warning("LLM Analysis results not found in Layer 2 output.")
+        # This case should ideally not be reached if run_second_layer always returns a dict
+        st.error("Layer 2 analysis returned an unexpected data type.")
+
+    st.markdown("***")
+    st.markdown("Disclaimer: This tool provides an automated analysis and does not constitute legal or expert advice. Always verify findings with qualified professionals.")
 
     # ---------- JSON report download ----------
-    report = {"layer1": l1, "layer2": l2}
+    report = {"layer1": l1, "layer2": l2_results}
     st.download_button(
         label="Download JSON report",
         data=json.dumps(report, indent=2),

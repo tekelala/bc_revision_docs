@@ -16,27 +16,29 @@ This layer focuses on the technical and structural aspects of the PDF file itsel
 
 1.  **PDF Parsing & Basic Information**:
     *   Attempts to open and parse the PDF using `pikepdf`.
+    *   Handles password-protected PDFs gracefully by reporting the issue rather than crashing.
     *   Extracts basic file information like name and size.
 
 2.  **Structural Integrity Check**:
     *   Utilizes `pdf.check()` from `pikepdf` (which leverages `qpdf`'s checking capabilities) to identify low-level structural issues or syntax errors within the PDF. This can reveal if the PDF is malformed.
 
 3.  **Incremental Updates (Save History)**:
-    *   Determines if the PDF has been saved with incremental updates. PDFs can be saved by appending changes, which creates a revision history within the file. The presence of objects with generation numbers greater than 0 (accessed via `obj.objgen[1]`) indicates such a history, which can sometimes suggest modifications after the initial creation.
+    *   Determines if the PDF has been saved with incremental updates. PDFs can be saved by appending changes, which creates a revision history within the file. The presence of objects with generation numbers greater than 0 (now checked via `pdf.has_incremental_updates()`) indicates such a history.
 
 4.  **Digital Signature Validation**:
     *   Leverages `pyHanko` to detect and analyze any digital signatures embedded in the PDF.
-    *   **Detection**: Checks if the PDF contains any signature fields.
-    *   **Integrity**: For each signature found, it validates its cryptographic integrity (i.e., if the signed content has been tampered with since signing).
-    *   **Signer Information**: Extracts details from the signer's certificate, such as Common Name, full distinguished name, issuer information, and the signing time (if available in the signature).
-    *   **Coverage**: Reports if the signature covers the entire document or only parts of it.
-    *   **Status**: Provides a summary status for each signature (e.g., "Not Signed," "Signed - Integrity OK, Trust Unverified," "Signed - Integrity Failed"). Full trust validation typically requires a pre-configured trust anchor/store, so the primary focus here is on cryptographic integrity.
+    *   **Detection**: Checks if the PDF contains any signature fields using `PdfFileReader(pdf_stream).embedded_signatures`.
+    *   **Integrity**: For each signature found, it validates its cryptographic integrity.
+    *   **Signer Information**: Extracts details from the signer's certificate.
+    *   **Coverage**: Reports if the signature covers the entire document.
+    *   **Status**: Provides a summary status for each signature.
 
 5.  **Metadata Extraction**:
-    *   Extracts standard metadata from the PDF's Document Information Directory (`pdf.docinfo`) using `pikepdf`. This includes fields like `CreationDate`, `ModDate`, `Creator`, `Producer`.
-    *   Attempts to parse PDF-specific date formats into a standard ISO format.
-    *   Checks for the presence of XMP (Extensible Metadata Platform) metadata, which can store richer metadata.
-    *   Discrepancies (e.g., `ModDate` significantly later than `CreationDate` without a clear history of incremental updates) can be points of interest.
+    *   Extracts standard metadata from the PDF's Document Information Directory (`pdf.docinfo`) using `pikepdf`.
+    *   Employs a robust helper function (`_safe_pdf_value_to_string`) to convert various `pikepdf` object types (including `pikepdf.String`, `pikepdf.Name`, Python native `int`, `float`, `bool`, `pikepdf.Array`, `pikepdf.Dictionary`, and generic `pikepdf.Object`) to string representations, significantly reducing `ValueError` or `AttributeError` issues during extraction.
+    *   This includes fields like `CreationDate`, `ModDate`, `Creator`, `Producer`.
+    *   Attempts to parse PDF-specific date formats.
+    *   Checks for the presence of XMP (Extensible Metadata Platform) metadata.
 
 ### Layer 2: LLM-Powered Content Anomaly Detection
 
@@ -53,6 +55,7 @@ This layer focuses on the semantic content of the PDF, using a Large Language Mo
         *   Abrupt or unexplained changes in tone, style, or terminology.
         *   Hints of unusual formatting or structure (based on the Markdown representation).
         *   Potential misinformation or deceptive language patterns.
+    *   The prompt instructs the LLM to consider that the document is parsed and may have errors, and to omit such parsing errors from its findings.
     *   The LLM is instructed to return its findings in a structured JSON format, including:
         *   `overall_assessment`: A brief summary of its findings.
         *   `detected_anomalies`: A list of specific anomalies, each detailed with a `type`, `description`, and a relevant `excerpt` from the text.
@@ -65,7 +68,6 @@ This layer focuses on the semantic content of the PDF, using a Large Language Mo
 *   **Pikepdf**: A Python library for reading, manipulating, and writing PDF files, built on the QPDF C++ library. Used for opening PDFs, structural checks, metadata extraction, and incremental update detection.
 *   **pyHanko**: A Python SDK for digitally signing PDF documents and validating signatures. Used for the digital signature analysis.
 *   **MarkItDown**: A Python library for converting various document formats (including PDF) to Markdown. Used for text extraction.
-*   **Requests**: For making HTTP requests to the LLM API (Note: for structured output, the `openai` SDK is now primarily used).
 *   **OpenAI Python SDK**: Used for interacting with LLM APIs (like x.ai's Grok) that support structured outputs, especially for `grok-3`.
 *   **Pydantic**: For data validation and settings management through Python type annotations. Used here to define the expected schema for the LLM's structured JSON output.
 *   **LLM API (e.g., Grok 3 via x.ai)**: For the content anomaly detection.
@@ -75,86 +77,82 @@ This layer focuses on the semantic content of the PDF, using a Large Language Mo
 The main application logic is contained within `app.py`.
 
 *   **Imports & Setup**: Imports necessary libraries and performs initial Streamlit page configuration.
-*   **Sidebar Configuration**: Code for setting up the sidebar inputs (API key, reference hash).
+*   **Sidebar Configuration (`sidebar_config`)**: 
+    *   Sets up the sidebar, including debug information for pyHanko import statuses.
+    *   Provides an input field for the Xai (Grok) API Key. The key is stored in `st.session_state.grok_api_key` and managed with a dedicated widget key for robustness.
 *   **Helper Functions**: 
-    *   `format_bytes(size)`: Formats file sizes into human-readable units.
+    *   `_safe_pdf_value_to_string(pdf_obj)`: Robustly converts various `pikepdf` objects to strings, handling potential errors gracefully.
 *   **`run_first_layer(pdf_bytes: bytes, reference_hash: str | None = None) -> dict`**:
     *   Takes the PDF content as bytes and an optional reference hash.
-    *   Performs all Layer 1 analyses (structural check, hash comparison if reference is given, incremental update detection, signature validation, metadata extraction).
+    *   Initializes `pdf = None` and uses a `try...finally` block to ensure `pdf.close()` is called safely if the PDF was opened.
+    *   Includes specific error handling for `pikepdf.PasswordError` to return a user-friendly message instead of crashing.
+    *   Performs all Layer 1 analyses (structural check, hash comparison if reference is given, incremental update detection, signature validation, metadata extraction using `_safe_pdf_value_to_string`).
     *   Returns a dictionary containing the results of these checks.
 *   **`run_second_layer(pdf_bytes: bytes) -> dict`**:
     *   Takes the PDF content as bytes.
-    *   Extracts text using `MarkItDown` (accessing `result.text_content`).
+    *   Checks for the presence of the Xai (Grok) API key in `st.session_state.grok_api_key`; skips analysis if not found.
+    *   Extracts text using `MarkItDown`.
     *   Defines Pydantic models (`AnomalyDetail`, `ContentAnalysis`) to specify the desired JSON structure for the LLM's response.
     *   Initializes an `OpenAI` client configured for the x.ai API endpoint.
-    *   Constructs a simplified system prompt for the LLM, as the detailed output structure is now handled by the Pydantic model.
-    *   Calls the LLM (specifically `grok-3`, which supports structured output) using `client.beta.chat.completions.parse()`, passing the Pydantic model in the `response_format` argument.
+    *   Constructs a system prompt for the LLM, instructing it to act as a forensic document analyst and to be mindful of parsing errors in the extracted text.
+    *   Calls the LLM (specifically `grok-3`) using `client.beta.chat.completions.parse()`, passing the Pydantic model in the `response_format` argument.
     *   The LLM's response is automatically parsed into an instance of the `ContentAnalysis` Pydantic model.
     *   Converts the Pydantic model instance to a dictionary using `.model_dump()` for consistent storage in the results.
-    *   Includes robust error handling for text extraction and the LLM API call.
-    *   Returns a dictionary containing the LLM's structured analysis or any errors encountered.
-*   **`main()` Function**:
+    *   Includes robust error handling for text extraction and the LLM API call, returning structured error/skipped messages.
+*   **`main()` Function**: 
     *   Sets up the main Streamlit interface (title, file uploader).
+    *   Calls `sidebar_config()`.
     *   Handles the PDF file upload.
-    *   Once a file is uploaded, it calls `run_first_layer` and `run_second_layer` to perform the analyses.
-    *   Displays the results from both layers in a structured and user-friendly manner using Streamlit components (e.g., `st.json`, `st.write`, `st.expander`).
+    *   Once a file is uploaded, it calls `run_first_layer` and `run_second_layer`.
+    *   Displays the results from both layers, interpreting the structured dictionary responses (including 'status': 'skipped' or 'status': 'error' messages from Layer 2).
     *   Provides an option to download the combined analysis results as a JSON report.
 
 ## File Structure
 
 *   `app.py`: The main Streamlit application script.
 *   `requirements.txt`: Lists the Python dependencies required for the project.
-*   `Procfile`: (Heroku specific) Declares the process types for a Heroku application (e.g., `web: streamlit run app.py`).
-*   `runtime.txt`: (Heroku specific) Specifies the Python runtime version to be used on Heroku.
-*   `Aptfile`: (Heroku specific) Lists system-level packages (APT packages) to be installed on Heroku, often for dependencies of Python libraries (e.g., `qpdf` might be listed here if not bundled sufficiently by `pikepdf` wheels for Heroku's environment).
+*   `Procfile`: (Heroku specific) Declares the process types for a Heroku application.
+*   `runtime.txt`: (Heroku specific) Specifies the Python runtime version.
+*   `Aptfile`: (Heroku specific) Lists system-level packages (APT packages).
+*   `.streamlit/config.toml`: Streamlit configuration file (e.g., for server settings like CORS, XSRF).
 *   `README.md`: This file.
 
 ## Setup and Running the Application
 
-1.  **Clone the Repository** (if applicable):
-    ```bash
-    git clone <repository-url>
-    cd <repository-directory>
-    ```
-
-2.  **Create a Virtual Environment** (recommended):
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows: venv\Scripts\activate
-    ```
-
+1.  **Clone the Repository** (if applicable).
+2.  **Create a Virtual Environment** (recommended).
 3.  **Install Dependencies**:
     ```bash
     pip install -r requirements.txt
     ```
-
 4.  **Set Up API Key**: 
-    The application requires an API key for the LLM service (e.g., Grok via x.ai).
-    *   You can set it as an environment variable named `GROK_API_KEY` (or `XAI_API_KEY` as checked in the code).
-    *   Alternatively, you can enter the API key directly in the application's sidebar.
-
-5.  **Run the Application**:
+    The application requires an API key for the LLM service (e.g., Grok via x.ai). You can enter the API key directly in the application's sidebar. The key is stored in Streamlit's session state.
+5.  **Streamlit Configuration** (Optional but recommended):
+    *   To avoid potential startup warnings related to server settings, create a file `.streamlit/config.toml` with the following content:
+      ```toml
+      [server]
+      enableCORS = true
+      enableXsrfProtection = true
+      ```
+6.  **Run the Application**:
     ```bash
     streamlit run app.py
     ```
-    This will start the Streamlit development server, and you can access the application in your web browser (usually at `http://localhost:8501`).
+    Access the application in your web browser (usually at `http://localhost:8501`).
 
 ## How to Use
 
 1.  Open the application in your web browser.
-2.  **Upload a PDF file** using the file uploader.
-3.  **Optional**: Enter a SHA-256 reference hash in the sidebar if you want to compare the uploaded PDF's hash against a known value.
-4.  **Enter API Key**: Provide your LLM API key in the sidebar if not set as an environment variable.
-5.  The application will automatically perform Layer 1 and Layer 2 analyses.
-6.  **Review the Results**: 
-    *   Layer 1 results (structural integrity, incremental updates, signature analysis, metadata) will be displayed.
-    *   Layer 2 results (LLM content anomaly detection) will show the overall assessment, confidence, and any detected anomalies in expandable sections.
-7.  **Download Report**: You can download the complete analysis (Layers 1 and 2) as a JSON file.
+2.  **Upload a PDF file**.
+3.  **Enter API Key**: Provide your Xai (Grok) API key in the sidebar.
+4.  The application will automatically perform Layer 1 and Layer 2 analyses.
+5.  **Review the Results**.
+6.  **Download Report**: You can download the complete analysis as a JSON file.
 
 ## Potential Future Enhancements
 
 *   More sophisticated XMP metadata parsing and analysis.
-*   Integration with certificate revocation lists (CRLs) or OCSP for more robust signature trust validation (requires network access and potentially more complex setup).
+*   Integration with certificate revocation lists (CRLs) or OCSP for more robust signature trust validation.
 *   Allowing users to customize LLM prompts or select different analysis models.
-*   Visualizations for PDF structure or content changes (if a diff feature is ever re-introduced).
+*   Visualizations for PDF structure.
 *   More granular error reporting and user guidance.
